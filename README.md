@@ -139,11 +139,13 @@ Across the three lots the versions are 1, 3, and 161. That is 165 writes, one fo
 
 ![process_bid: 126 successes and 106 errors on the portal summary.](figures/azure-process-bid.png)
 
-`process_bid` shows 126 successes and 106 errors. I have not opened one red invocation, so I do not have the exception text. From the code, a portal error is an invocation that raised. A clash that is caught and retried inside the 12 attempts does not raise. The invocation raises if those 12 writes all lose, or if some other exception is not caught. Azure then delivers the queue message again. The next invocation can find the bid already stored and still enqueue the decision.
+`process_bid` shows 126 successes and 106 errors. I treated that as a possible bug and followed it through.
 
-I therefore separate two things. The 106 errors are failed executions of an attempt. They are expected when many invocations compete for one version, and they are still failures of that attempt. They are not 106 missing bids. The lot versions, 1 + 3 + 161 = 165, are evidence that 165 bid-state updates were committed. They do not prove that `process_bid` ran exactly once per bid, and they do not prove that every `results/<bid_id>.json` file exists.
+The portal count for that minute is 232 invocations, which is 126 + 106. I opened five failed traces from 22:07:53 UTC. Each one lasted about 2.7–2.9 seconds and ended in the same place: `RuntimeError: Could not record bid <bid_id>`. That is the line the function raises after 12 lost writes. The storage calls behind it returned `412 ConditionNotMet` on `auction/lots/003.json`. A clash that is caught inside those 12 attempts does not turn the invocation red. The red row is the attempt that used them all up. The traces did not show a failed dependency, and `409 ContainerAlreadyExists` only means the container was already there.
 
-After the runs I opened the queues in storage account `auctionhousergac6f`. The only queues were `incoming-bids` and `bid-results`. Azure had not created `incoming-bids-poison` or `bid-results-poison`. `incoming-bids` itself was empty. A poison queue appears only after a message has failed the dequeue limit, which is five deliveries when the app does not set another limit [2]. No message reached that limit. The failed attempts were retried, and the messages were then removed from the queue.
+I then checked whether “could not record” meant the bid had disappeared. One of the failed ids, `20261102-220537-837afea0`, is still in `lots/003.json`, recorded as outbid. The queue had delivered the message again, and a later invocation had written the decision. The 106 errors are failed attempts. They are not 106 missing bids. The lot versions, 1 + 3 + 161 = 165, are evidence that 165 bid-state updates were committed. They do not prove that `process_bid` ran exactly once per bid, and they do not prove that every `results/<bid_id>.json` file exists.
+
+The last check was the queue itself. In storage account `auctionhousergac6f` the only queues were `incoming-bids` and `bid-results`. Azure had not created `incoming-bids-poison` or `bid-results-poison`, and `incoming-bids` was empty. A poison queue appears only after a message has failed the dequeue limit, which is five deliveries when the app does not set another limit [2]. No message reached that limit. The failed attempts were retried, and then the messages were removed. The auction result was intact.
 
 ![The storage account has incoming-bids and bid-results, and no poison queue.](figures/azure-queues.png)
 
@@ -181,13 +183,13 @@ The useful comparison is one popular lot against many quieter lots. A last-secon
 | --- | --- | --- |
 | 161 Azure HTTP calls, 0 failures | `receive_bid` accepted a rising concurrent load | How long the whole workflow took to finish |
 | Lot versions 1, 3, and 161 | 165 bid-state updates were committed, with one leader on each lot | That every function ran exactly once, or that every result file exists |
-| Portal tile, 106 `process_bid` errors | Some attempts raised and were counted as failures | The exception text, or the exact number of lost bids |
+| 106 failed `process_bid` invocations | Attempts that exhausted 12 writes after `412 ConditionNotMet` on lot 003 | That 106 bids were lost. One failed id is still stored on the lot |
 | `record_result`, 164 successes and 0 errors | The third function's sampled runs did not fail | A complete count of `results/` blobs |
 | Laptop, 1,000 bids | Contention and the 80-attempt cap in the local model | Azure's behaviour at 1,000 bids |
 
 ## Limitations
 
-The lots and the bidders are fictional. The chances in the story are the minimum rises I chose, not prices from a real sale. The largest contention run, 1,000 bids, was on my laptop. Azure was tested up to 100 concurrent HTTP calls, once each. I did not measure the time from sending a bid to the appearance of its result file, so I do not claim a completion-time percentile for the whole workflow. I did not open the exception text inside a failed `process_bid` trace. I did check the queues: no poison queue had been created.
+The lots and the bidders are fictional. The chances in the story are the minimum rises I chose, not prices from a real sale. The largest contention run, 1,000 bids, was on my laptop. Azure was tested up to 100 concurrent HTTP calls, once each. I did not measure the time from sending a bid to the appearance of its result file, so I do not claim a completion-time percentile for the whole workflow. I followed five failed `process_bid` traces and the queues. The five traces showed the same `412` conflict and the same give-up error. I did not read all 106 traces one by one. No poison queue had been created.
 
 ## References
 
