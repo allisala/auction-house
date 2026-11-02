@@ -80,9 +80,58 @@ The deadline in these runs is 18:00:00 UTC on 3 November 2026. Mina, Owen, and P
 | Sam | £400 | 18:00:01 | late |
 | Noor | £450 | 18:00:06 | late |
 
-## One lot, or twenty
+## What Azure did
 
-I then threw the same kind of bid at the rules from several threads at once. Every bidder had seen £120 and offered at least one minimum rise above it, so a loss means the price moved, not that the bid was silly at the start. One run puts every bid on the pocket watch. The other spreads them across 20 lots. These numbers are from my laptop, with threads standing in for concurrent function executions. I have not deployed this house to Azure yet. A second run can move the clash count a little, because the threads race. The decision rules do not move.
+I deployed the three functions as the app `auction-house` in Switzerland North. The address of `receive_bid` is:
+
+`https://auction-house-b2fjhsc3gneda8cw.switzerlandnorth-01.azurewebsites.net/api/bids`
+
+The deadline on that app is `2026-11-03 18:00:00` UTC. Bids sent on the evening of 2 November were on time.
+
+**One bid on the pocket watch.** Bob bid £180 against the opening price of £120. The HTTP reply was `Queued bid 20261102-215819-687f02c7`. After the queues had run, `lots/001.json` had highest £180, leader Bob, and version 1. `results/20261102-215819-687f02c7.json` says `"reason": "accepted"`. The price he beat was £120, and there was no previous leader.
+
+**Three bids on the painting.** I sent Alice £550, then Bob £650, then Charlie £600. All three had seen £500. The lot file ended at version 3, so each bid was written once.
+
+| Bidder | Bid | Price on the book | Result |
+| --- | --- | --- | --- |
+| Alice | £550 | £500 | accepted |
+| Bob | £650 | £550, leader Alice | accepted |
+| Charlie | £600 | £650, leader Bob | outbid |
+
+Charlie's £600 would have been enough at the opening price. It was not enough once Bob was the leader. The final leader is Bob, on £650.
+
+**161 bids on the typewriter.** I posted batches of 1, 10, 50, and 100 bids together, all on lot 003. That is 161 calls to `receive_bid`. Every call returned successfully. The client clock stops at that reply.
+
+| Bids together | Whole batch | Median reply | 95th percentile | Slowest | Failed |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 2.757 s | 2.756 s | 2.756 s | 2.756 s | 0 |
+| 10 | 2.920 s | 2.579 s | 2.901 s | 2.901 s | 0 |
+| 50 | 1.193 s | 0.495 s | 0.918 s | 1.181 s | 0 |
+| 100 | 1.580 s | 0.723 s | 1.400 s | 1.555 s | 0 |
+
+The first batches took about 3 seconds because the app was idle. After it was warm, the median dropped below a second. At 100 bids together the median was 0.723 seconds and the slowest reply was 1.555 seconds. These times are not the time spent updating the price.
+
+When `process_bid` had finished, `lots/003.json` was at version 161. One version for each bid, so none was lost and none was applied twice. Seven bids were accepted. The price moved £80, £105, £120, £125, £160, £215, £250, £280. The other 154 were outbid. The leader is bidder-79 at £280, which is the highest offer in the batch. Another bidder also offered £280 and was rejected, because the minimum rise is £5 and the book already said £280. One stored leader, not two.
+
+Across the three lots the versions are 1, 3, and 161. That is 165 writes, one for each call `receive_bid` accepted.
+
+**What the portal counted.** I opened Invocations for each function after the typewriter batches. The page lists at most 20 rows. Sampling is on for everything except HTTP requests, so the success tiles for the two queue functions are a sample. The lot files are the count of finished decisions.
+
+![receive_bid: 165 successes and 0 errors. The visible rows are about 100 ms.](figures/azure-receive-bid.png)
+
+`receive_bid` shows 165 successes and 0 errors. That is Bob, plus Alice, Bob, and Charlie, plus the 161 typewriter bids. The rows on screen are from 10:05 PM, after the app was warm, and the portal duration is about 85–125 ms. The client times in the table above are longer because they include the network and the idle start.
+
+![process_bid: 126 successes and 106 errors on the portal summary.](figures/azure-process-bid.png)
+
+`process_bid` shows 126 successes and 106 errors. Those errors are failed attempts to write the same lot, not missing bids. During the typewriter rush several invocations read the same version. Only one write lands. This function tries again up to 12 times. If all 12 lose, that invocation is an error and the queue delivers the bid again. A later attempt can succeed. The 165 versions across the three lot files are the bids that did land. I do not use 126 or 106 as the number of bids.
+
+![record_result: 164 successes and 0 errors, with durations around 330 ms.](figures/azure-record-result.png)
+
+`record_result` shows 164 successes and 0 errors. The visible durations are about 330–350 ms. The third function did not fail. The tile is one short of 165, and this page is a sample, so I treat the lot files as the full set.
+
+## One lot, or twenty, on my laptop
+
+Before the Azure run I tried the same rules with threads on my laptop, so I could see a rush of 1,000 bids. Every bidder had seen £120 and offered at least one minimum rise above it. One run puts every bid on a single lot. The other spreads them across 20 lots. A second run can move the clash count a little, because the threads race. The decision rules do not move. Azure itself only has the three catalogue lots, so the 20-lot case stays on the laptop.
 
 ![Failed compare-and-swap attempts. One lot climbs at 500 and 1000 bids. Twenty lots stay low.](figures/contention.png)
 
@@ -123,7 +172,7 @@ auction-house/
 | [function_app.py](function_app.py) | The three Azure functions. |
 | [auction.py](auction.py) | Judging a bid, and the in-memory version check. |
 | [scripts/make_figures.py](scripts/make_figures.py) | Runs the batches and writes the pictures. |
-| [figures/](figures/) | Lots, workflow, the watch, contention, outcomes, latency. |
+| [figures/](figures/) | Lots, workflow, the watch, contention, outcomes, latency, and the three portal screenshots. |
 | [results/](results/) | The csv tables behind the pictures. |
 | [walkthrough/pocket_watch.md](walkthrough/pocket_watch.md) | The two orders of Alice, Bob, and Charlie. |
 
