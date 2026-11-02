@@ -18,7 +18,7 @@ The question I want the system to answer is: what happens to the price, and to t
 
 - A bid below the current price plus the minimum rise is rejected.
 - A bid that the server received after the deadline is rejected. I use the server time, not the clock on the bidder's laptop.
-- Two updates of the same lot cannot both land. The write carries the version I just read. If that version has already moved, the write fails, I read the lot again, and I judge the bid against the new price.
+- Concurrent updates cannot both succeed against the same lot version. The write carries the version I just read. If that version has already moved, the write fails, I read the lot again, and I judge the bid against the new price.
 - One lot has one leader and one highest bid.
 - Every bid id is remembered. A second delivery of the same message does not raise the price twice.
 - Accepted and rejected bids can be read back afterwards.
@@ -27,7 +27,7 @@ The question I want the system to answer is: what happens to the price, and to t
 
 ![The bidder calls receive_bid. A queue starts process_bid. A second queue starts record_result.](figures/workflow.png)
 
-The functions do not call each other. Each queue message is an id and a file name. The bid itself sits in blob storage.
+The functions do not call each other. A queue trigger starts the next one [1], [2]. Each queue message is an id and a file name. The bid itself sits in blob storage. The version check is optimistic concurrency [5].
 
 | Place | What is stored |
 | --- | --- |
@@ -50,9 +50,25 @@ The functions do not call each other. Each queue message is an id and a file nam
 
 `seen_price` is the price the bidder thought was current. I use it only to tell two kinds of loss apart: too low from the start, or outbid while the bid was waiting.
 
-**2. process_bid.** Queue trigger on `incoming-bids`. It reads the lot and the etag. If this bid id is already on the lot, it keeps the old decision. Otherwise it judges the bid and writes the lot back only if the etag still matches. Azure calls that an `If-Match` write. A clash raises `ResourceModifiedError`. I try again, up to 80 times, against the price I just reread. Then it queues the decision.
+**2. process_bid.** Queue trigger on `incoming-bids`. It reads the lot and the etag. If this bid id is already stored on the lot, it keeps that decision and does not change the price. Otherwise it judges the bid and writes the lot back only if the etag still matches. Azure calls that an `If-Match` write [3]. A clash raises `ResourceModifiedError`.
 
-**3. record_result.** Queue trigger on `bid-results`. It writes `results/<bid_id>.json`. A repeat delivery overwrites that same file.
+On Azure, one invocation tries that write up to 12 times. Twelve is the deployed limit in `function_app.py`. The laptop model uses a different limit, 80, and a failed bid there is abandoned. On Azure, if all 12 attempts lose, the invocation raises an error. The queue then delivers the message again as a new invocation. A caught clash inside those 12 attempts is not, by itself, a portal error. A portal error is an invocation that raised.
+
+After a successful write, or after finding that this bid id was already applied, the function writes `decisions/<bid_id>.json` and sends a pointer on `bid-results`. If the function crashes after the price write and before that send, the retry finds the stored decision and still sends the pointer. The price is not raised a second time. `record_result` then writes the same result path again.
+
+**3. record_result.** Queue trigger on `bid-results`. It writes `results/<bid_id>.json`. A repeat delivery overwrites that same file. That is at-least-once execution with an idempotent file path, not a proof that the function ran exactly once.
+
+## Why Python
+
+I used Python for the functions and for the program that sends the bids. Azure Functions runs Python 3 as a supported worker, so the same language is deployed and used to generate the workload [4]. The HTTP calls need only the standard library. Matplotlib, on the laptop, draws the figures. I did not need a second language to judge a bid, store JSON, or summarise a batch.
+
+## How the tests were run
+
+Each workload below was run once. I did not repeat a batch and average it.
+
+**Azure.** The app is `auction-house` in Switzerland North. A short Python script on my laptop posted JSON to `POST /api/bids` with `ThreadPoolExecutor`, one worker per bid in the batch. The batches were 1, then 10, then 50, then 100, all on lot 003, and each batch started only after the previous one had finished. The amount was `80 + 5 * ((i % 40) + 1)` pounds, so every bid was at least one minimum rise above the opening price of £80, and the same amounts recur. `seen_price` was 80. The reported time is the client interval from sending the request to reading the HTTP response. It ends when `receive_bid` replies. It is not the time until `results/<bid_id>.json` exists. I did not measure that end-to-end interval.
+
+**Laptop.** `scripts/make_figures.py` uses the same judge and compare-and-swap rules in memory, with up to 32 threads. Seed 7 fixes the amounts: each bid is £120 plus 1 to 40 steps of £10. One case puts every bid on one lot. The other spreads the same bids across 20 lots. Azure only accepts lots 001, 002, and 003, so the 20-lot case was not deployed. A bid that still loses after 80 attempts is marked `gave_up`. The clock is the time until every thread has returned. Because the threads race, a second run can change the clash count. The zeros at 50 and 100 bids on one lot are from this single run. They are not a stable result.
 
 ## Three people, one watch
 
@@ -111,11 +127,11 @@ Charlie's £600 would have been enough at the opening price. It was not enough o
 
 The first batches took about 3 seconds because the app was idle. After it was warm, the median dropped below a second. At 100 bids together the median was 0.723 seconds and the slowest reply was 1.555 seconds. These times are not the time spent updating the price.
 
-When `process_bid` had finished, `lots/003.json` was at version 161. One version for each bid, so none was lost and none was applied twice. Seven bids were accepted. The price moved £80, £105, £120, £125, £160, £215, £250, £280. The other 154 were outbid. The leader is bidder-79 at £280, which is the highest offer in the batch. Another bidder also offered £280 and was rejected, because the minimum rise is £5 and the book already said £280. One stored leader, not two.
+When `process_bid` had finished, `lots/003.json` was at version 161. One version for each bid, so none was lost and none was applied twice. Seven bids were accepted. The price moved £80, £105, £120, £125, £160, £215, £250, £280. The remaining 154 bids were rejected as outbid. The leader is bidder-79 at £280, which is the highest offer in the batch. Another bidder also offered £280 and was rejected, because the minimum rise is £5 and the book already said £280. One stored leader, not two.
 
 Across the three lots the versions are 1, 3, and 161. That is 165 writes, one for each call `receive_bid` accepted.
 
-**What the portal counted.** I opened Invocations for each function after the typewriter batches. The page lists at most 20 rows. Sampling is on for everything except HTTP requests, so the success tiles for the two queue functions are a sample. The lot files are the count of finished decisions.
+**What the portal counted.** I opened Invocations for each function after the typewriter batches. The page lists at most 20 rows. Sampling is on for everything except HTTP requests, so the success tiles for the two queue functions are a sample. The final lot versions provide evidence of committed bid-state updates.
 
 ![receive_bid: 165 successes and 0 errors. The visible rows are about 100 ms.](figures/azure-receive-bid.png)
 
@@ -123,11 +139,17 @@ Across the three lots the versions are 1, 3, and 161. That is 165 writes, one fo
 
 ![process_bid: 126 successes and 106 errors on the portal summary.](figures/azure-process-bid.png)
 
-`process_bid` shows 126 successes and 106 errors. Those errors are failed attempts to write the same lot, not missing bids. During the typewriter rush several invocations read the same version. Only one write lands. This function tries again up to 12 times. If all 12 lose, that invocation is an error and the queue delivers the bid again. A later attempt can succeed. The 165 versions across the three lot files are the bids that did land. I do not use 126 or 106 as the number of bids.
+`process_bid` shows 126 successes and 106 errors. I have not opened one red invocation, so I do not have the exception text. From the code, a portal error is an invocation that raised. A clash that is caught and retried inside the 12 attempts does not raise. The invocation raises if those 12 writes all lose, or if some other exception is not caught. Azure then delivers the queue message again. The next invocation can find the bid already stored and still enqueue the decision.
+
+I therefore separate two things. The 106 errors are failed executions of an attempt. They are expected when many invocations compete for one version, and they are still failures of that attempt. They are not 106 missing bids. The lot versions, 1 + 3 + 161 = 165, are evidence that 165 bid-state updates were committed. They do not prove that `process_bid` ran exactly once per bid, and they do not prove that every `results/<bid_id>.json` file exists.
+
+After the runs I opened the queues in storage account `auctionhousergac6f`. The only queues were `incoming-bids` and `bid-results`. Azure had not created `incoming-bids-poison` or `bid-results-poison`. `incoming-bids` itself was empty. A poison queue appears only after a message has failed the dequeue limit, which is five deliveries when the app does not set another limit [2]. No message reached that limit. The failed attempts were retried, and the messages were then removed from the queue.
+
+![The storage account has incoming-bids and bid-results, and no poison queue.](figures/azure-queues.png)
 
 ![record_result: 164 successes and 0 errors, with durations around 330 ms.](figures/azure-record-result.png)
 
-`record_result` shows 164 successes and 0 errors. The visible durations are about 330–350 ms. The third function did not fail. The tile is one short of 165, and this page is a sample, so I treat the lot files as the full set.
+`record_result` shows 164 successes and 0 errors. The visible durations are about 330–350 ms. This tile does not show a failed recording. It is one short of 165, the page is sampled, and I did not count the blobs in `results/`. I do not claim that all 165 result files were written.
 
 ## One lot, or twenty, on my laptop
 
@@ -143,15 +165,41 @@ Before the Azure run I tried the same rules with threads on my laptop, so I coul
 | 500 | 0.914 | 511 | 0 | 0.030 | 0 |
 | 1,000 | 15.072 | 8,052 | 81 | 0.127 | 265 |
 
-On one lot, 1,000 bids took about 15 seconds and 81 bids gave up after 80 failed writes. Spread over 20 lots, the same 1,000 bids took about 0.13 seconds and nobody gave up. The fight is not "how many bids exist". The fight is how many of them want the same stored price.
+On one lot, 1,000 bids took about 15 seconds and 81 bids were abandoned after 80 failed writes. Spread over 20 lots, the same 1,000 bids took about 0.13 seconds, with 265 clashes and no abandoned bids. Contention depends on how many bids target the same shared state, not only on how many bids exist. Optimistic concurrency keeps a single leader, but under that load it also produces repeated reads, failed writes, and abandoned bids. That can raise both latency and the number of executions. The 81 abandoned bids exist because the laptop stops at 80 attempts. The deployed function stops at 12 attempts inside one invocation and then leaves the retry to the queue.
 
 ![On the pocket watch, most bids are outbid while they wait. At 1,000 bids, some give up.](figures/outcomes.png)
 
-At 1,000 bids on the watch, 3 were accepted, 916 were outbid while waiting, and 81 were given up. The stored price still reached the highest offer in the batch, £520. The cap on retries is what creates the failures. Without that cap the function would keep rereading. With it, a bid can be abandoned so the rest of the auction can move.
+At 1,000 bids on one lot, 3 were accepted, 916 were rejected as outbid, and 81 were abandoned. The stored price still reached the highest offer in the batch, £520. The retry cap is what creates the abandoned bids. Without a cap the model would keep rereading. With a cap, a bid can be dropped so the rest of the run can finish.
 
 ![Time until every bid has a decision. One lot pulls away from twenty lots.](figures/latency.png)
 
-The useful comparison is the popular lot against the quiet rooms. A last-second rush on one object is where the version checks, the retries, and the abandoned bids show up.
+The useful comparison is one popular lot against many quieter lots. A last-second rush on one object is where the version checks, the retries, and the abandoned bids show up.
+
+## What each result shows
+
+| Evidence | What it shows | What it does not show |
+| --- | --- | --- |
+| 161 Azure HTTP calls, 0 failures | `receive_bid` accepted a rising concurrent load | How long the whole workflow took to finish |
+| Lot versions 1, 3, and 161 | 165 bid-state updates were committed, with one leader on each lot | That every function ran exactly once, or that every result file exists |
+| Portal tile, 106 `process_bid` errors | Some attempts raised and were counted as failures | The exception text, or the exact number of lost bids |
+| `record_result`, 164 successes and 0 errors | The third function's sampled runs did not fail | A complete count of `results/` blobs |
+| Laptop, 1,000 bids | Contention and the 80-attempt cap in the local model | Azure's behaviour at 1,000 bids |
+
+## Limitations
+
+The lots and the bidders are fictional. The chances in the story are the minimum rises I chose, not prices from a real sale. The largest contention run, 1,000 bids, was on my laptop. Azure was tested up to 100 concurrent HTTP calls, once each. I did not measure the time from sending a bid to the appearance of its result file, so I do not claim a completion-time percentile for the whole workflow. I did not open the exception text inside a failed `process_bid` trace. I did check the queues: no poison queue had been created.
+
+## References
+
+[1] Microsoft, "Azure Functions overview." https://learn.microsoft.com/en-us/azure/azure-functions/functions-overview
+
+[2] Microsoft, "Azure Queue storage trigger for Azure Functions." https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-storage-queue-trigger
+
+[3] Microsoft, "Managing concurrency in Blob Storage." https://learn.microsoft.com/en-us/azure/storage/blobs/concurrency-manage
+
+[4] Microsoft, "Azure Functions Python developer guide." https://learn.microsoft.com/en-us/azure/azure-functions/functions-reference-python
+
+[5] H. T. Kung and J. T. Robinson, "On optimistic methods for concurrency control," *ACM Transactions on Database Systems*, vol. 6, no. 2, pp. 213–226, 1981.
 
 ## Where the files are
 
