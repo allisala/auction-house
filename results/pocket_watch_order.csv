@@ -1,0 +1,4 @@
+bidder,amount,reason,highest_after,leader,clashes
+Alice,150,accepted,150,Alice,0
+Bob,180,accepted,180,Bob,0
+Charlie,160,outbid,180,Bob,0

@@ -1,0 +1,13 @@
+.git*
+.vscode
+.venv
+__pycache__
+local.settings.json
+scripts
+figures
+results
+walkthrough
+*.csv
+*.png
+*.md
+.DS_Store

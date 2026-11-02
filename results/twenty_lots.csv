@@ -1,0 +1,6 @@
+bids,lots,seconds,accepted,too_low,outbid,late,gave_up,clashes,retries,highest,leader,top_offer,spread
+10,20,0.0005,10,0,0,0,0,0,0,330,bidder-0000,500,twenty
+50,20,0.0016,31,0,19,0,0,0,0,490,bidder-0040,500,twenty
+100,20,0.0035,40,0,60,0,0,0,0,490,bidder-0040,520,twenty
+500,20,0.0296,75,0,425,0,0,0,0,520,bidder-0160,520,twenty
+1000,20,0.1271,74,0,926,0,0,265,265,520,bidder-0340,520,twenty
