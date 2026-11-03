@@ -2,6 +2,9 @@
 
 **A serverless auction experiment in concurrency, consistency and scalability**
 
+**Alisa Lamina** · **Student ID:** 202138390  
+**University of Leeds** · **COMP3212 — Resilient Distributed Systems**
+
 What happens when 100 people try to bid on the same object at once? An auction has to accept requests quickly, but it also has to keep one correct price and one leader. I built **The Auction House** to explore that trade-off using Azure Functions, queues and optimistic concurrency.
 
 The project is a small technical prototype, not a commercial auction website. Its lots and bidders are fictional; the problem of concurrent updates is real.
@@ -25,6 +28,18 @@ I wanted to answer three questions:
 3. **Contention:** What happens when those bids all compete to update the same lot?
 
 The rules are straightforward. A valid bid must meet the current price plus the lot's minimum increase, and it must have arrived before the deadline according to the server clock. A duplicate bid ID must not change the price twice. Both accepted and rejected decisions should be stored for later inspection.
+
+## Business value: where could this system be used?
+
+I did not want to build an auction just to demonstrate three Azure Functions. The practical problem is that an auction organiser needs to accept bids from different people without losing updates or accidentally giving the same lot two leaders. Checking every offer manually might work for a room with a few bidders. It becomes much harder when bids arrive online, especially just before an auction closes.
+
+The Auction House could provide the **bid-processing backend** for a small auction service. For example:
+
+- **Charity or university fundraising auctions:** Participants bid on donated items online. The organiser needs a consistent leading price and a record of accepted and rejected offers.
+- **Specialist collectors' auctions:** Several collectors compete for one rare item. Conditional updates prevent two simultaneous requests from overwriting the same price.
+- **Event or community auctions:** A website collects bids while the serverless workflow processes them in the background, so the visitor does not have to keep an HTTP connection open while every check runs.
+
+The business value is therefore **reliable bid handling, an inspectable decision history and an HTTP entry point that can acknowledge submissions without waiting for the full workflow**. Serverless infrastructure also allows the application to run without managing a dedicated server.
 
 ## Architecture: following a bid
 
