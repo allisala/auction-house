@@ -1,83 +1,46 @@
 # The Auction House
 
-## Repository
+**A serverless auction experiment in concurrency, consistency and scalability**
 
-The function files stay in this folder because Azure deploys the folder as one Function App. Pictures, scripts, and the walkthrough are not part of that deploy.
+What happens when 100 people try to bid on the same object at once? An auction has to accept requests quickly, but it also has to keep one correct price and one leader. I built **The Auction House** to explore that trade-off using Azure Functions, queues and optimistic concurrency.
 
-```text
-auction-house/
-├── function_app.py          receive_bid, process_bid, record_result
-├── auction.py               the price rules and the compare-and-swap
-├── host.json                the Functions host, including telemetry sampling
-├── requirements.txt         the Azure libraries the deploy installs
-├── local.settings.json.example
-├── scripts/make_figures.py  the laptop batches and the pictures
-├── figures/                 architecture, lots, graphs, portal screenshots
-├── results/                 the csv tables behind the graphs
-└── walkthrough/             Alice, Bob, and Charlie, in two orders
-```
+The project is a small technical prototype, not a commercial auction website. Its lots and bidders are fictional; the problem of concurrent updates is real.
 
-| File | What it is |
+![Three fictional auction lots: a pocket watch, a painting and a typewriter.](figures/lots.png)
+
+| Lot | Object | Starting price | Minimum increase |
+| --- | --- | ---: | ---: |
+| 001 | Victorian Pocket Watch — No. 14, still ticking | £120 | £10 |
+| 002 | Room With No Door — unsigned oil painting | £500 | £25 |
+| 003 | The Travelling Remington — portable typewriter, 1934 | £80 | £5 |
+
+## The problem
+
+Imagine that several bidders see the same current price and submit offers within milliseconds. A system that simply reads the price and writes a new one can lose updates when two requests arrive together. It can also mistake an HTTP acknowledgement for a successful bid.
+
+I wanted to answer three questions:
+
+1. **Consistency:** Can concurrent bids be processed without corrupting the price or recording two leaders?
+2. **Responsiveness:** How quickly does the HTTP endpoint accept increasing numbers of bids?
+3. **Contention:** What happens when those bids all compete to update the same lot?
+
+The rules are straightforward. A valid bid must meet the current price plus the lot's minimum increase, and it must have arrived before the deadline according to the server clock. A duplicate bid ID must not change the price twice. Both accepted and rejected decisions should be stored for later inspection.
+
+## Architecture: following a bid
+
+![Azure architecture: three functions, two queues and the requests, lots, decisions and results blob paths.](figures/architecture.jpg)
+
+The application runs as **one Azure Function App** with three functions. They do not call one another directly. Instead, each stage leaves a small message in a Storage Queue, which triggers the next stage [1, 2]. The messages contain a bid ID and a pointer to a JSON blob; the actual bid and decision stay in Blob Storage.
+
+| Stage | What happens |
 | --- | --- |
-| [function_app.py](function_app.py) | The three Azure functions. |
-| [auction.py](auction.py) | Judging a bid, and the in-memory version check used on the laptop. |
-| [scripts/make_figures.py](scripts/make_figures.py) | Runs the local batches and writes the pictures. |
-| [figures/architecture.jpg](figures/architecture.jpg) | The deployed path: functions, queues, and blob files. |
-| [figures/](figures/) | Lots, the local graphs, and the portal screenshots. |
-| [results/](results/) | The csv tables behind the local graphs and the Azure HTTP table. |
-| [walkthrough/pocket_watch.md](walkthrough/pocket_watch.md) | The two orders of Alice, Bob, and Charlie. |
+| **1. `receive_bid`** · HTTP | Validates `POST /api/bids`, records the server time, saves `requests/<bid_id>.json`, creates the lot file if missing and sends a pointer to `incoming-bids`. |
+| **2. `process_bid`** · queue | Reads the request and `lots/<lot_id>.json`, judges the offer and conditionally updates the lot using its ETag. Saves `decisions/<bid_id>.json` and sends a pointer to `bid-results`. |
+| **3. `record_result`** · queue | Reads the decision and writes the final outcome to `results/<bid_id>.json`. |
 
-To draw the local pictures again, from a laptop environment that has matplotlib:
+Both queues carry `{"bid_id", "blob"}`. For `incoming-bids`, `blob` points to `requests/<bid_id>.json`; for `bid-results`, it points to `decisions/<bid_id>.json`. All four paths are in the `auction` Blob container.
 
-```bash
-python3 scripts/make_figures.py
-```
-
-## The idea
-
-I built a small auction for three fictional objects.
-
-| Lot | Object | Opens at | Minimum rise |
-| --- | --- | --- | --- |
-| 001 | Victorian Pocket Watch, no. 14, still ticking | £120 | £10 |
-| 002 | Room With No Door, oil, unsigned | £500 | £25 |
-| 003 | The Travelling Remington, 1934 | £80 | £5 |
-
-![Lot 001 is a pocket watch at £120. Lot 002 is a painting at £500. Lot 003 is a typewriter at £80.](figures/lots.png)
-
-The objects are made up. The problem is not. Several people try to change the same price at nearly the same moment. The house has to reject a bid that is too low, reject a bid that the server received after the deadline, and still finish with one leader. Two bidders must not both be stored as the winner.
-
-The question I investigated is how a larger number of concurrent bids changes three things: whether the stored price stays consistent, how fast the HTTP entry point answers, and how much contention appears when every bid targets one lot.
-
-That is the situation in a last-second rush on one object. The same arrangement applies anywhere many writers must update one shared record, such as the current high bid, without declaring two winners. It is not a shop. There are no accounts and no payments. The useful part is the shared price.
-
-What has to stay true:
-
-- A bid below the current price plus the minimum rise is rejected.
-- The deadline uses the server time, not the clock on the bidder's laptop.
-- Concurrent updates cannot both succeed against the same lot version. The write carries the version just read. If that version has moved, the write fails, the lot is read again, and the bid is judged against the new price [3], [5].
-- One lot has one leader and one highest bid.
-- A second delivery of the same bid id does not raise the price twice.
-- Accepted and rejected bids can be read back afterwards.
-
-## How it was built
-
-### Architecture
-
-![Bidders call receive_bid. Queues carry a file pointer. process_bid updates the lot only if the ETag matches. record_result stores the decision.](figures/architecture.jpg)
-
-The functions do not call each other. A queue trigger starts the next one [1], [2]. Each queue message is `{"bid_id", "blob"}`. The bid and the decision stay in blob storage.
-
-| Place | What is stored |
-| --- | --- |
-| `auction/requests/<bid_id>.json` | The bid `receive_bid` accepted for checking. |
-| Queue `incoming-bids` | `{"bid_id", "blob"}`, with `blob` set to `requests/<bid_id>.json`. This starts `process_bid`. |
-| `auction/lots/<lot_id>.json` | The price, the leader, the version, and the bids already judged. |
-| `auction/decisions/<bid_id>.json` | The judgement `process_bid` saved for the next function. |
-| Queue `bid-results` | `{"bid_id", "blob"}`, with `blob` set to `decisions/<bid_id>.json`. This starts `record_result`. |
-| `auction/results/<bid_id>.json` | The final accepted or rejected outcome. |
-
-**receive_bid** is the HTTP function, `POST /api/bids`. It checks `lot_id`, `bidder`, and `amount`, stamps the bid with the server time, writes `requests/<bid_id>.json`, and queues the pointer. On the first bid for a lot it also creates `lots/<lot_id>.json`. The reply is `Queued bid <id>`. That reply does not mean the bid won.
+Here is an example request:
 
 ```json
 {
@@ -88,193 +51,160 @@ The functions do not call each other. A queue trigger starts the next one [1], [
 }
 ```
 
-`seen_price` is the price the bidder thought was current. I use it only to separate a bid that was too low at the start from a bid that was outbid while it waited.
+`seen_price` records what the bidder believed the price was. It helps distinguish an offer that was too low from one that became insufficient while waiting. The HTTP reply, `Queued bid <id>`, confirms **submission**, not acceptance or victory.
 
-**process_bid** is triggered by `incoming-bids`. It reads the request file, then reads the lot and its ETag. If this bid id is already on the lot, it keeps that decision and does not change the price. Otherwise it judges the bid and writes the lot back only if the ETag still matches. A clash raises `ResourceModifiedError`. On Azure, one invocation tries that write up to 12 times. If all 12 lose, the invocation raises `RuntimeError: Could not record bid <bid_id>`, and the queue delivers the message again as a new invocation. A clash caught inside the 12 attempts does not, by itself, make the portal row red. After a successful write, or after finding that the bid was already applied, the function writes `decisions/<bid_id>.json` and queues the pointer. If it stops after the price write and before that send, the retry still sends the stored decision. The price is not raised a second time.
+### Keeping the price consistent
 
-**record_result** is triggered by `bid-results`. It reads the decision file and writes `results/<bid_id>.json`. A repeat delivery overwrites that same path. That is at-least-once execution with an idempotent file, not a proof that the function ran exactly once.
+The difficult part is the shared lot file. `process_bid` reads the lot and its ETag, then tries to write an updated version **only if the ETag still matches**. If another invocation changed the lot first, the conditional write fails; the function rereads the latest state and judges the bid again [3, 5]. Two competing writes cannot both succeed against the same version.
 
-### Decisions
+This implementation tries the conditional write up to **12 times within one invocation**. If those attempts fail, the invocation raises an error and the queue can redeliver the message. The lot also records previously judged bid IDs. If a retry finds the bid already applied, it reuses the stored decision instead of raising the price again, then continues towards the result file. `record_result` writes to a deterministic path, so repeated deliveries overwrite the same result. This is **idempotent processing under at-least-once delivery**, not exactly-once execution.
 
-I used Python for the functions and for the program that sends the bids. Azure Functions runs Python 3 as a supported worker, so the same language is deployed and used to generate the workload [4]. The HTTP calls need only the standard library. Matplotlib, on the laptop, draws the figures.
+I used **Python** for the Azure functions, the HTTP workload generator and the local experiments. Azure Functions supports Python, and using the same language made it easier to share the bid rules between the cloud application and the local model [4]. Matplotlib produces the graphs.
 
-I split the work into three functions because accepting a bid, judging it against a shared price, and storing the outcome are different steps. The HTTP function returns before the price has moved. The queue, not a direct call, starts the next function, so a failure in one step can be retried without the caller holding the connection [2]. The queue carries a pointer because the bid and the lot are larger than a signal, and the files can be read again.
+## Testing the system
 
-The lot write uses the ETag so two updates cannot both succeed against one version [3]. I chose a cap of 12 attempts inside one Azure invocation, then let the queue deliver the message again. The laptop model uses a different cap, 80, and a bid that still loses is abandoned there. Those two numbers are not the same setting.
+I tested the deployed workflow on Azure and used a separate in-memory laptop model to explore larger workloads. These are different experiments and should not be treated as equivalent. **Each workload was run once**, so the figures describe these runs rather than stable averages.
 
-I did not build accounts, payments, or a website. The assignment is the serverless workflow.
+### 1. Does the workflow work?
 
-### Azure configuration
+First I submitted **Bob's £180 bid** for the pocket watch. Azure returned `Queued bid 20261102-215819-687f02c7`. After the queue-triggered functions ran, the lot showed Bob as leader at £180, version 1, and the corresponding result blob recorded an accepted bid.
 
-The Function App is `auction-house`, in the resource group `auction-house-rg`, region Switzerland North. The portal shows Linux, the Flex Consumption plan, and 2048 MB of instance memory. `receive_bid` is HTTP. `process_bid` and `record_result` are queue triggers.
+Next I sent three offers for the painting:
 
-![The auction-house app in Switzerland North, with the three functions enabled.](figures/azure-overview.png)
+| Bidder | Offer | Price when judged | Outcome |
+| --- | ---: | --- | --- |
+| Alice | £550 | £500 | Accepted |
+| Bob | £650 | £550, Alice leading | Accepted |
+| Charlie | £600 | £650, Bob leading | Outbid |
 
-`receive_bid` is at:
+Charlie's offer would have beaten the opening price, but not Bob's new bid. The painting ended at **£650, with Bob as its only leader and lot version 3**.
 
-`https://auction-house-b2fjhsc3gneda8cw.switzerlandnorth-01.azurewebsites.net/api/bids`
+![Azure lot 002 showing the final painting state.](figures/azure-lot-002.png)
 
-The storage account is `auctionhousergac6f`. The container is `auction`. The deadline setting used by the functions is `2026-11-03 18:00:00` UTC, so bids sent on the evening of 2 November were on time. `host.json` turns telemetry sampling on for everything except HTTP requests, which is why I treat the queue-function tiles as a sample unless a trace confirms them. The queue dequeue limit is the platform default of five, because the app does not set another one [2].
+### 2. How quickly does Azure accept more bids?
 
-### How the experiments were designed
+I submitted batches of **1, 10, 50 and 100 concurrent HTTP requests**, all for the typewriter (lot 003). A Python script used one worker thread per bid. Each batch began after the previous batch's HTTP responses had returned. The offers were generated using `80 + 5 * ((i % 40) + 1)` pounds, with `seen_price` set to £80; amounts therefore repeated.
 
-Each workload was run once. I did not repeat a batch and average it.
-
-On Azure, a Python script posted JSON to `/api/bids` with one worker thread per bid. The batches were 1, then 10, then 50, then 100, all on lot 003, and each batch started only after the previous HTTP batch had returned. The amount was `80 + 5 * ((i % 40) + 1)` pounds, so every bid was at least one minimum rise above £80, and amounts recur. `seen_price` was 80. The reported HTTP time is the client interval from sending the request to reading the response. It ends when `receive_bid` replies. The workflow time, from the `Queued bid` log to the `recorded as` log, is reported separately in the results.
-
-On the laptop, `scripts/make_figures.py` uses the same judge and compare-and-swap, in memory, with up to 32 threads. Seed 7 fixes the amounts: £120 plus 1 to 40 steps of £10. One case puts every bid on one lot. The other spreads them across 20 lots. The deployed app only accepts lots 001, 002, and 003, so the 20-lot case was not run on Azure. The laptop clock runs until every thread has returned. A second run can change the clash count. The zeros at 50 and 100 bids on one lot are from this single run. They are not a stable result.
-
-The Alice, Bob, and Charlie figures, and the last-minute figure, are worked examples of the rules. The last-minute case was not a live Azure test at those timestamps.
-
-## Results
-
-The brief asks for a workflow of at least two functions, the second started automatically by the first, a justified language, a test that increases the number of invocations, and a discussion of the performance. This section keeps those apart.
-
-### The workflow ran on Azure
-
-Bob's bid is the single-bid check. I posted £180 for lot 001. The reply was `Queued bid 20261102-215819-687f02c7`. After the queues had run, `lots/001.json` had highest £180, leader Bob, and version 1. `results/20261102-215819-687f02c7.json` says `"reason": "accepted"`. `receive_bid` did not call `process_bid`. The queue did.
-
-The painting is the three-bid check. I sent Alice £550, then Bob £650, then Charlie £600, all with `seen_price` 500. The lot ended at version 3.
-
-| Bidder | Bid | Price on the book | Result |
-| --- | --- | --- | --- |
-| Alice | £550 | £500 | accepted |
-| Bob | £650 | £550, leader Alice | accepted |
-| Charlie | £600 | £650, leader Bob | outbid |
-
-Charlie's £600 would have been enough at the opening price. It was not enough once Bob was the leader. One leader was stored. The end of `lots/002.json` shows Charlie rejected, the price at the decision still £650, and version 3.
-
-![The painting file ends with Charlie outbid and version 3.](figures/azure-lot-002.png)
-
-![receive_bid: 165 successes and 0 errors.](figures/azure-receive-bid.png)
-
-![process_bid invocations, including the error count.](figures/azure-process-bid.png)
-
-![record_result: successes and no errors in the sampled tile.](figures/azure-record-result.png)
-
-`receive_bid` shows 165 successes and 0 errors. That is Bob, the three painting bids, and the 161 typewriter bids. The rows on screen from 10:05 PM, after the app was warm, show portal durations of about 85–125 ms. `record_result` shows 164 successes and 0 errors, with visible durations of about 330–350 ms. Those queue rows are what shows that the later functions ran without being called directly.
-
-### Scalability
-
-I increased the number of calls to `receive_bid` from 1 to 100. Every call in these batches was accepted.
-
-| Bids together | Whole batch | Median reply | 95th percentile | Slowest | Failed |
-| --- | --- | --- | --- | --- | --- |
+| Concurrent requests | Batch duration | Median HTTP response | 95th percentile | Slowest | HTTP failures |
+| ---: | ---: | ---: | ---: | ---: | ---: |
 | 1 | 2.757 s | 2.756 s | 2.756 s | 2.756 s | 0 |
 | 10 | 2.920 s | 2.579 s | 2.901 s | 2.901 s | 0 |
 | 50 | 1.193 s | 0.495 s | 0.918 s | 1.181 s | 0 |
 | 100 | 1.580 s | 0.723 s | 1.400 s | 1.555 s | 0 |
 
-The first batches took about 3 seconds. An idle start may have contributed, but this run did not isolate cold-start time. In the later batches the median fell below a second. At 100 bids together the median was 0.723 seconds and the slowest reply was 1.555 seconds.
+**All 161 HTTP requests were acknowledged.** The first batches took around three seconds; an idle start may have contributed, but I did not isolate cold-start overhead. At 100 concurrent bids, the median reply took **0.723 seconds**.
 
-These times stop when `receive_bid` replies. The warm portal rows for `receive_bid` are about 85–125 ms, shorter than the client times because the client also waits on the network. Successful `process_bid` rows from the same evening are about 816–831 ms. Successful `record_result` rows are about 327–345 ms. Adding those durations does not give the workflow time, because a bid can sit in a queue between the functions.
+However, this is only the time until `receive_bid` responds. It does **not** mean the bid has finished processing.
 
-I measured that gap from the logs. `queued_at` is the trace `Queued bid <id>` from `receive_bid`. `done_at` is the trace `<id> recorded as ...` from `record_result`. For the 164 bids that have both lines between 21:00 and 23:00 UTC, the difference is:
+### 3. How long did the asynchronous workflow take?
 
-| Bids with both logs | Median | 95th percentile | Slowest | Fastest |
-| --- | --- | --- | --- | --- |
-| 164 | 138.6 s | 140.3 s | 143.6 s | 3.2 s |
+To look beyond HTTP responses, I matched the `Queued bid <id>` trace from `receive_bid` with the `<id> recorded as ...` trace from `record_result` in Application Insights. For the **164 bids with both log messages** between 21:00 and 23:00 UTC:
 
-![Log query: 164 bids, median 138.6 seconds from queueing the bid to recording the result.](figures/azure-completion-time.png)
+| Matched bids | Median log-to-log interval | 95th percentile | Fastest | Slowest |
+| ---: | ---: | ---: | ---: | ---: |
+| 164 | **138.6 s** | 140.3 s | 3.2 s | 143.6 s |
 
-The fast case, 3.2 seconds, is a bid that did not wait behind the typewriter rush. The median near 139 seconds is that rush. The HTTP call had already returned. The bid then waited while `process_bid` retried lost writes on `lots/003.json`. One hundred bids at once were cheap to accept and slow to finish, because they all wanted the same lot.
+![Application Insights query showing the matched log intervals.](figures/azure-completion-time.png)
 
-Two changes would shorten that wait. I did not deploy either of them, so the numbers above are for the system with 12 attempts and many writers.
+This was the biggest surprise of the project. The HTTP endpoint could acknowledge a burst quickly, while the same bids took much longer to reach the final recording stage. The **138.6-second median** was dominated by the typewriter rush: many queue-triggered invocations were competing to update `lots/003.json`. The interval starts at the application's queueing log, not at the client's initial request, and it is not a benchmark of an idle auction.
 
-One writer per lot would stop the `412` storm. The bids would still be applied one after another. A successful `process_bid` took about 0.8 seconds, so the last bid in a rush of 100 would still wait on the order of a minute. The wait would be the length of the queue, not a pile of failed retries. Raising the 12-attempt cap, with a short pause between tries, would let more bids finish inside the same invocation. The portal would show fewer red rows. The writes to one file would still be serial. Spreading the bids across lots removes the wait. The laptop run is the evidence for that: 1,000 bids across 20 lots produced 265 clashes and no abandoned bids, against 8,052 clashes and 81 abandoned bids on one lot. The reply stays `Queued bid`, because the HTTP call does not yet know the winner.
+### 4. Why were there failed Azure invocations?
 
-### Consistency, and the errors I investigated
+Azure showed **126 successful and 106 failed `process_bid` invocations** during the busy period. I investigated the errors rather than assuming they meant 106 lost bids.
 
-![The typewriter file opens at highest £280, with bidder-79 as leader.](figures/azure-lot-003.png)
+One failed trace, operation `220fa7360049694cf375980460819b42`, showed a message already on `DequeueCount: 2`, repeated **HTTP 412** responses when trying to update the lot, and then a `Gave up` message followed by a failed invocation after 2,708 ms. That pattern is consistent with exhausting the 12 conditional-write attempts. The earlier **409** in that trace was the already-existing container, not the failed lot update.
 
-When `process_bid` had finished with the typewriter, `lots/003.json` was at version 161. Seven bids were accepted. The price moved £80, £105, £120, £125, £160, £215, £250, £280. The remaining 154 bids were rejected as outbid. The leader is bidder-79 at £280, the highest offer in the batch. Another bidder also offered £280 and was rejected, because the minimum rise is £5 and the book already said £280.
+![Failed process_bid invocation with repeated 412 responses.](figures/azure-process-bid-trace.png)
 
-Across the three lots the versions are 1, 3, and 161. That is 165 committed updates, one for each accepted HTTP call. The version count does not prove that each function ran only once, or that every result blob was written.
+I also found a bid ID from a failed attempt later recorded as outbid in the lot file. This demonstrates recovery for that example: a failed **invocation** did not necessarily mean a missing **bid**. I inspected five failed traces in detail and one full trace, not all 106, so I cannot claim every failure had exactly the same cause.
 
-The portal showed 126 successes and 106 errors for `process_bid`. I treated that as a possible bug and followed it.
+After processing, `lots/003.json` had **version 161**. Seven typewriter bids were accepted, moving the price from £80 to £280; the other 154 were recorded as outbid. The final leader was `bidder-79` at £280. The versions across all three lots were **1 + 3 + 161 = 165**, matching the 165 accepted HTTP submissions across the single-bid, three-bid and scalability checks.
 
-Application Insights counts 232 invocations in that minute, which is 126 + 106. I opened one failed operation, `220fa7360049694cf375980460819b42`. The queue message already had `DequeueCount: 2`. The trace reads `requests/20261102-220540-a51d1aca.json`, then reads `lots/003.json` and receives `412` on the writes. The last lines are `Gave up on 20261102-220540-a51d1aca` and `Executed 'Functions.process_bid' (Failed, Duration=2708ms)`. That give-up line is written immediately before `RuntimeError: Could not record bid <bid_id>`. The `409` earlier in the same trace only means the container already existed.
+![Final state of the typewriter auction.](figures/azure-lot-003.png)
 
-![One failed process_bid trace: repeated 412 responses, then Gave up, then a failed execution of 2708 ms.](figures/azure-process-bid-trace.png)
+Both queues were empty when checked and no poison queue was visible. The portal showed 164 successful `record_result` invocations and no errors in that sampled view. These observations support the recovery story, but **I did not count and match all files in `results/`**, so I cannot confirm that every one of the 165 bids produced a final result blob.
 
-One of those ids, `20261102-220537-837afea0`, is still in `lots/003.json`, recorded as outbid. The queue delivered it again and a later invocation wrote it. The 106 errors are failed attempts. They are not 106 missing bids.
+### 5. What happens at 1,000 bids?
 
-![The storage account has incoming-bids and bid-results, and no poison queue.](figures/azure-queues.png)
+The largest experiment ran **locally, not on Azure**. `scripts/make_figures.py` uses the same bid rules and an in-memory compare-and-swap model, up to 32 threads, seed 7 and a maximum of **80 attempts per bid**. One scenario directs every offer to one lot; the other spreads them across 20 lots. The deployed Azure application supports only three lots, so the 20-lot scenario was not deployed.
 
-![incoming-bids has no messages left.](figures/azure-incoming-bids.png)
+![Local experiment: compare-and-swap clashes as load increases.](figures/contention.png)
 
-![bid-results has no messages left.](figures/azure-bid-results.png)
+| Bids | One lot: time | One lot: clashes | One lot: abandoned | 20 lots: time | 20 lots: clashes |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | 0.003 s | 9 | 0 | 0.001 s | 0 |
+| 50 | 0.005 s | 0 | 0 | 0.002 s | 0 |
+| 100 | 0.019 s | 0 | 0 | 0.004 s | 0 |
+| 500 | 0.914 s | 511 | 0 | 0.030 s | 0 |
+| 1,000 | **15.072 s** | **8,052** | **81** | **0.127 s** | **265** |
 
-![The auction container has decisions, lots, requests, and results.](figures/azure-container.png)
+At 1,000 bids, the one-lot case had **8,052 failed compare-and-swap attempts** and **81 bids abandoned** after reaching the local retry limit. Spreading the same number of bids across 20 lots reduced clashes to **265**, with no abandoned bids. In the single-lot run, three bids were accepted, 916 were rejected as outbid, and the stored price reached the highest offer, £520.
 
-In storage account `auctionhousergac6f` the only queues were `incoming-bids` and `bid-results`. No poison queue had been created. Both queues were empty when I opened them. A poison queue appears only after a message fails the dequeue limit of five [2]. No message reached that limit. The container `auction` has the four folders the functions use: `decisions`, `lots`, `requests`, and `results`. The auction result was intact.
+![Local experiment: processing time for one lot versus twenty lots.](figures/latency.png)
 
-`record_result` shows 164 successes and 0 errors. The tile is one short of 165, the page is sampled, and I did not count the blobs in `results/`. I do not claim that all 165 result files were written.
+The important factor was not simply the number of bids: it was **how many writers were competing for the same record**. Optimistic concurrency protected the lot state, but under heavy contention it also caused extra reads, failed writes and retries. The zero clashes at 50 and 100 bids came from individual runs; they are not evidence of a general trend.
 
-### What the laptop run adds
+## What I learned
 
-The laptop run is not an Azure measurement. It is the same rules at 1,000 bids, which I did not send to Azure. One case uses one lot. The other spreads the bids across 20 lots.
+The system exposed a trade-off I did not see from HTTP timings alone: **accepting work quickly is different from completing it quickly**. Queues let the HTTP function return without waiting, while ETags prevent conflicting lot updates. But when many bids target one file, the retries become a bottleneck.
 
-![Failed compare-and-swap attempts. One lot climbs at 500 and 1,000 bids. Twenty lots stay low.](figures/contention.png)
+One possible improvement would be **one writer per lot**, which could reduce ETag conflicts by serialising updates to each lot. Another would be changing the retry strategy. Neither change was deployed or benchmarked, so I cannot claim a measured speed-up. Even with one writer, bids on a popular lot would still have to wait their turn.
 
-| Bids together | One lot, seconds | One lot, clashes | One lot, gave up | Twenty lots, seconds | Twenty lots, clashes |
-| --- | --- | --- | --- | --- | --- |
-| 10 | 0.003 | 9 | 0 | 0.001 | 0 |
-| 50 | 0.005 | 0 | 0 | 0.002 | 0 |
-| 100 | 0.019 | 0 | 0 | 0.004 | 0 |
-| 500 | 0.914 | 511 | 0 | 0.030 | 0 |
-| 1,000 | 15.072 | 8,052 | 81 | 0.127 | 265 |
+### Limits of this evaluation
 
-![Most bids on one lot are rejected as outbid. At 1,000 bids, some are abandoned.](figures/outcomes.png)
+- The objects and bids are fictional; there are no accounts, payments or production auction guarantees.
+- Azure was tested with up to **100 concurrent HTTP submissions**, once per batch. The **1,000-bid** experiment was an in-memory laptop model with different retry behaviour.
+- The **138.6-second** median measures two application log events for 164 matched bids, not client-to-result latency for every request.
+- The portal uses telemetry sampling. I investigated selected failures, not every error, and did not verify all 165 final result blobs.
+- The local workload results are single runs; scheduling and clash counts can vary between runs.
 
-![Time until every local bid has a decision. One lot pulls away from twenty lots.](figures/latency.png)
+## A closer look at the bidding rules
 
-On one lot, 1,000 bids took about 15 seconds, with 8,052 clashes and 81 abandoned bids. Across 20 lots, the same 1,000 bids took about 0.13 seconds, with 265 clashes and no abandoned bids. Three bids were accepted on the single lot, 916 were rejected as outbid, and the stored price still reached the highest offer, £520. Contention depends on how many bids target the same record, not only on how many bids exist. Optimistic concurrency keeps one leader, and under that load it also produces repeated reads, failed writes, and, once the cap is hit, abandoned bids. The 81 abandoned bids exist because the laptop stops at 80 attempts. Azure stops at 12 inside one invocation and then leaves the retry to the queue. The zeros at 50 and 100 bids are one run. They do not make a curve.
+For a small, readable example, the pocket watch starts at £120. In the order **Alice £150 → Bob £180 → Charlie £160**, Alice and Bob are accepted and Charlie is outbid. Changing the order to **Charlie → Alice → Bob** changes which bids are accepted, but Bob still ends at £180. Replaying Bob's bid ID does not raise the price twice. The step-by-step tables are in [the pocket-watch walkthrough](walkthrough/pocket_watch.md).
 
-### Worked examples of the rules
+![Worked example: the pocket watch and three bids.](figures/pocket_watch.png)
 
-These two figures were produced by the rule code on the laptop. They are not the Azure batches above.
+I also tested the deadline rules locally with simulated server timestamps. Mina, Owen and Priya bid before **18:00:00 UTC on 3 November 2026** and were accepted; Sam and Noor bid after the deadline and were rejected as late, even though their offers were higher. This was **not a live Azure test at those timestamps**.
 
-The watch opens at £120. Alice bids £150, Bob £180, and Charlie £160. In that order, Alice and Bob are accepted and Charlie is rejected. In the order Charlie, Alice, Bob, Alice is the one rejected, and Bob is still the leader on £180. The tables are in [walkthrough/pocket_watch.md](walkthrough/pocket_watch.md). Sending Bob's bid through the rules a second time leaves the price at £180.
+![Worked example: bids immediately before and after the deadline.](figures/last_second.png)
 
-![The pocket watch moves from £120 to £150 to £180. Charlie is rejected.](figures/pocket_watch.png)
+## Project files and environment
 
-The deadline in the worked example is 18:00:00 UTC on 3 November 2026. Mina, Owen, and Priya bid in the last 30 seconds and are accepted. Sam and Noor bid higher after 18:00 and are late. Priya keeps the watch at £310.
+```text
+auction-house/
+├── function_app.py          # receive_bid, process_bid, record_result
+├── auction.py               # bid rules and local compare-and-swap
+├── host.json                # Functions host and telemetry sampling
+├── requirements.txt         # Azure dependencies
+├── local.settings.json.example
+├── scripts/make_figures.py  # local experiments and charts
+├── figures/                 # architecture, charts and Azure evidence
+├── results/                 # experiment CSVs
+└── walkthrough/             # step-by-step bidding examples
+```
 
-![Five bids at the end of the pocket watch. The two after 18:00 are late.](figures/last_second.png)
+The three functions are deployed together in the `auction-house` Function App (Linux, Flex Consumption, 2048 MB) in **Switzerland North**, resource group `auction-house-rg`. The Storage account is `auctionhousergac6f`; the Blob container is `auction`. The configured deadline was **3 November 2026, 18:00 UTC**. The default queue dequeue limit was five, and `host.json` enabled telemetry sampling except for HTTP requests.
 
-| Bidder | Bid | Server time | Result |
-| --- | --- | --- | --- |
-| Mina | £200 | 17:59:31 | accepted |
-| Owen | £260 | 17:59:44 | accepted |
-| Priya | £310 | 17:59:58 | accepted |
-| Sam | £400 | 18:00:01 | late |
-| Noor | £450 | 18:00:06 | late |
+The HTTP endpoint used for the experiments was:
 
-### What each result is allowed to say
+`https://auction-house-b2fjhsc3gneda8cw.switzerlandnorth-01.azurewebsites.net/api/bids`
 
-| Evidence | What it shows | What it does not show |
-| --- | --- | --- |
-| 1, 10, 50, and 100 HTTP calls, 0 failures | `receive_bid` accepted a rising concurrent load | The time until the result file exists. That is the next row |
-| Lot versions 1, 3, and 161 | 165 bid-state updates were committed, with one leader on each lot | That every function ran exactly once, or that every result file exists |
-| 106 failed `process_bid` invocations | Attempts that exhausted 12 writes after `412 ConditionNotMet` on lot 003 | That 106 bids were lost. One failed id is still stored on the lot |
-| No poison queue, and an empty `incoming-bids` | No message reached the dequeue limit of five | A file-by-file check of `results/` |
-| 164 bids, log time from `Queued bid` to `recorded as` | Median 138.6 s to finish the workflow during the typewriter rush. Fastest 3.2 s | A completion time for a quiet lot, or for 1,000 Azure bids |
-| `record_result`, 164 successes and 0 errors | The sampled runs of the third function did not fail | A complete count of result blobs |
-| Laptop, 1,000 bids | Contention and the 80-attempt cap in the local model | Azure at 1,000 bids |
+To regenerate the local figures in an environment with Matplotlib installed:
 
-## Limitations
+```bash
+python3 scripts/make_figures.py
+```
 
-The lots and bidders are fictional. The starting prices and minimum rises were chosen for the experiment. The 1,000-bid run was on the laptop. Azure was tested up to 100 concurrent HTTP calls, once each. The 138.6 second median is the log gap from `Queued bid` to `recorded as` for 164 bids in that evening, dominated by the typewriter rush. It is not a benchmark of a quiet auction, and it is not 1,000 bids on Azure. I read five failed `process_bid` traces in detail, plus one full trace, not all 106. I did not count every blob in `results/` and match it to a bid id. The log join found 164 completed recordings, the same count as the `record_result` tile.
+The source code is in [`function_app.py`](function_app.py) and [`auction.py`](auction.py). Experiment tables are in [`results/`](results/), and additional Azure screenshots are in [`figures/`](figures/).
 
 ## References
 
-[1] Microsoft, "Azure Functions overview." https://learn.microsoft.com/en-us/azure/azure-functions/functions-overview
+[1] Microsoft, [Azure Functions overview](https://learn.microsoft.com/en-us/azure/azure-functions/functions-overview).
 
-[2] Microsoft, "Azure Queue storage trigger for Azure Functions." https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-storage-queue-trigger
+[2] Microsoft, [Azure Queue storage trigger for Azure Functions](https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-storage-queue-trigger).
 
-[3] Microsoft, "Managing concurrency in Blob Storage." https://learn.microsoft.com/en-us/azure/storage/blobs/concurrency-manage
+[3] Microsoft, [Managing concurrency in Blob Storage](https://learn.microsoft.com/en-us/azure/storage/blobs/concurrency-manage).
 
-[4] Microsoft, "Azure Functions Python developer guide." https://learn.microsoft.com/en-us/azure/azure-functions/functions-reference-python
+[4] Microsoft, [Azure Functions Python developer guide](https://learn.microsoft.com/en-us/azure/azure-functions/functions-reference-python).
 
-[5] H. T. Kung and J. T. Robinson, "On optimistic methods for concurrency control," *ACM Transactions on Database Systems*, vol. 6, no. 2, pp. 213–226, 1981.
+[5] H. T. Kung and J. T. Robinson (1981), “On optimistic methods for concurrency control,” *ACM Transactions on Database Systems*, 6(2), 213–226.
