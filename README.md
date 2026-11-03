@@ -120,7 +120,7 @@ The storage account is `auctionhousergac6f`. The container is `auction`. The dea
 
 Each workload was run once. I did not repeat a batch and average it.
 
-On Azure, a Python script posted JSON to `/api/bids` with one worker thread per bid. The batches were 1, then 10, then 50, then 100, all on lot 003, and each batch started only after the previous HTTP batch had returned. The amount was `80 + 5 * ((i % 40) + 1)` pounds, so every bid was at least one minimum rise above £80, and amounts recur. `seen_price` was 80. The reported time is the client interval from sending the request to reading the response. It ends when `receive_bid` replies. I did not measure the time until `results/<bid_id>.json` exists.
+On Azure, a Python script posted JSON to `/api/bids` with one worker thread per bid. The batches were 1, then 10, then 50, then 100, all on lot 003, and each batch started only after the previous HTTP batch had returned. The amount was `80 + 5 * ((i % 40) + 1)` pounds, so every bid was at least one minimum rise above £80, and amounts recur. `seen_price` was 80. The reported HTTP time is the client interval from sending the request to reading the response. It ends when `receive_bid` replies. The workflow time, from the `Queued bid` log to the `recorded as` log, is reported separately in the results.
 
 On the laptop, `scripts/make_figures.py` uses the same judge and compare-and-swap, in memory, with up to 32 threads. Seed 7 fixes the amounts: £120 plus 1 to 40 steps of £10. One case puts every bid on one lot. The other spreads them across 20 lots. The deployed app only accepts lots 001, 002, and 003, so the 20-lot case was not run on Azure. The laptop clock runs until every thread has returned. A second run can change the clash count. The zeros at 50 and 100 bids on one lot are from this single run. They are not a stable result.
 
@@ -167,7 +167,21 @@ I increased the number of calls to `receive_bid` from 1 to 100. Every call in th
 
 The first batches took about 3 seconds. An idle start may have contributed, but this run did not isolate cold-start time. In the later batches the median fell below a second. At 100 bids together the median was 0.723 seconds and the slowest reply was 1.555 seconds.
 
-These times stop when `receive_bid` replies. They are not the time until the result file exists, so I do not report a completion-time percentile for the whole workflow. The warm portal rows for `receive_bid` are about 85–125 ms, shorter than the client times because the client also waits on the network. Successful `process_bid` rows from the same evening are about 816–831 ms. Successful `record_result` rows are about 327–345 ms.
+These times stop when `receive_bid` replies. The warm portal rows for `receive_bid` are about 85–125 ms, shorter than the client times because the client also waits on the network. Successful `process_bid` rows from the same evening are about 816–831 ms. Successful `record_result` rows are about 327–345 ms. Adding those durations does not give the workflow time, because a bid can sit in a queue between the functions.
+
+I measured that gap from the logs. `queued_at` is the trace `Queued bid <id>` from `receive_bid`. `done_at` is the trace `<id> recorded as ...` from `record_result`. For the 164 bids that have both lines between 21:00 and 23:00 UTC, the difference is:
+
+| Bids with both logs | Median | 95th percentile | Slowest | Fastest |
+| --- | --- | --- | --- | --- |
+| 164 | 138.6 s | 140.3 s | 143.6 s | 3.2 s |
+
+![Log query: 164 bids, median 138.6 seconds from queueing the bid to recording the result.](figures/azure-completion-time.png)
+
+The fast case, 3.2 seconds, is a bid that did not wait behind the typewriter rush. The median near 139 seconds is that rush. The HTTP call had already returned. The bid then waited while `process_bid` retried lost writes on `lots/003.json`. One hundred bids at once were cheap to accept and slow to finish, because they all wanted the same lot.
+
+Two changes would shorten that wait. I did not deploy either of them, so the numbers above are for the system with 12 attempts and many writers.
+
+One writer per lot would stop the `412` storm. The bids would still be applied one after another. A successful `process_bid` took about 0.8 seconds, so the last bid in a rush of 100 would still wait on the order of a minute. The wait would be the length of the queue, not a pile of failed retries. Raising the 12-attempt cap, with a short pause between tries, would let more bids finish inside the same invocation. The portal would show fewer red rows. The writes to one file would still be serial. Spreading the bids across lots removes the wait. The laptop run is the evidence for that: 1,000 bids across 20 lots produced 265 clashes and no abandoned bids, against 8,052 clashes and 81 abandoned bids on one lot. The reply stays `Queued bid`, because the HTTP call does not yet know the winner.
 
 ### Consistency, and the errors I investigated
 
@@ -241,16 +255,17 @@ The deadline in the worked example is 18:00:00 UTC on 3 November 2026. Mina, Owe
 
 | Evidence | What it shows | What it does not show |
 | --- | --- | --- |
-| 1, 10, 50, and 100 HTTP calls, 0 failures | `receive_bid` accepted a rising concurrent load | How long the whole workflow took to finish |
+| 1, 10, 50, and 100 HTTP calls, 0 failures | `receive_bid` accepted a rising concurrent load | The time until the result file exists. That is the next row |
 | Lot versions 1, 3, and 161 | 165 bid-state updates were committed, with one leader on each lot | That every function ran exactly once, or that every result file exists |
 | 106 failed `process_bid` invocations | Attempts that exhausted 12 writes after `412 ConditionNotMet` on lot 003 | That 106 bids were lost. One failed id is still stored on the lot |
 | No poison queue, and an empty `incoming-bids` | No message reached the dequeue limit of five | A file-by-file check of `results/` |
+| 164 bids, log time from `Queued bid` to `recorded as` | Median 138.6 s to finish the workflow during the typewriter rush. Fastest 3.2 s | A completion time for a quiet lot, or for 1,000 Azure bids |
 | `record_result`, 164 successes and 0 errors | The sampled runs of the third function did not fail | A complete count of result blobs |
 | Laptop, 1,000 bids | Contention and the 80-attempt cap in the local model | Azure at 1,000 bids |
 
 ## Limitations
 
-The lots and bidders are fictional. The starting prices and minimum rises were chosen for the experiment. The 1,000-bid run was on the laptop. Azure was tested up to 100 concurrent HTTP calls, once each. I did not measure the interval from the HTTP post to the result file. I read five failed `process_bid` traces, not all 106. I did not count every blob in `results/` and match it to a bid id.
+The lots and bidders are fictional. The starting prices and minimum rises were chosen for the experiment. The 1,000-bid run was on the laptop. Azure was tested up to 100 concurrent HTTP calls, once each. The 138.6 second median is the log gap from `Queued bid` to `recorded as` for 164 bids in that evening, dominated by the typewriter rush. It is not a benchmark of a quiet auction, and it is not 1,000 bids on Azure. I read five failed `process_bid` traces in detail, plus one full trace, not all 106. I did not count every blob in `results/` and match it to a bid id. The log join found 164 completed recordings, the same count as the `record_result` tile.
 
 ## References
 
