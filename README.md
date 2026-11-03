@@ -92,9 +92,11 @@ I submitted batches of **1, 10, 50 and 100 concurrent HTTP requests**, all for t
 | 50 | 1.193 s | 0.495 s | 0.918 s | 1.181 s | 0 |
 | 100 | 1.580 s | 0.723 s | 1.400 s | 1.555 s | 0 |
 
-**All 161 HTTP requests were acknowledged.** The first batches took around three seconds; an idle start may have contributed, but I did not isolate cold-start overhead. At 100 concurrent bids, the median reply took **0.723 seconds**.
+**All 161 HTTP requests were acknowledged.** The first batches took around three seconds. Those were the first calls after the app had been idle, so an idle start may have contributed, but I did not run a separate cold-start trial. The batches of 50 and 100 were sent after the app had already answered, and the median reply fell below one second. At 100 concurrent bids, the median reply took **0.723 seconds**.
 
-However, this is only the time until `receive_bid` responds. It does **not** mean the bid has finished processing.
+![Median, 95th percentile and slowest HTTP reply as the number of simultaneous bids grows. The first two batches were sent while the app was idle.](figures/azure-http-latency.png)
+
+This graph is only the time until `receive_bid` responds. It does **not** mean the bid has finished processing.
 
 ### 3. How long did the asynchronous workflow take?
 
@@ -124,11 +126,21 @@ After processing, `lots/003.json` had **version 161**. Seven typewriter bids wer
 
 Both queues were empty when checked and no poison queue was visible. The portal showed 164 successful `record_result` invocations and no errors in that sampled view. These observations support the recovery story, but **I did not count and match all files in `results/`**, so I cannot confirm that every one of the 165 bids produced a final result blob.
 
-### 5. What happens at 1,000 bids?
+## What I learned
 
-The largest experiment ran **locally, not on Azure**. `scripts/make_figures.py` uses the same bid rules and an in-memory compare-and-swap model, up to 32 threads, seed 7 and a maximum of **80 attempts per bid**. One scenario directs every offer to one lot; the other spreads them across 20 lots. The deployed Azure application supports only three lots, so the 20-lot scenario was not deployed.
+The system exposed a trade-off I did not see from HTTP timings alone: **accepting work quickly is different from completing it quickly**. Queues let the HTTP function return without waiting, while ETags prevent conflicting lot updates. But when many bids target one file, the retries become a bottleneck.
 
-![Local experiment: compare-and-swap clashes as load increases.](figures/contention.png)
+One possible improvement would be **one writer per lot**, which could reduce ETag conflicts by serialising updates to each lot. Another would be changing the retry strategy. Neither change was deployed or benchmarked, so I cannot claim a measured speed-up. Even with one writer, bids on a popular lot would still have to wait their turn.
+
+## Going further
+
+I also ran 1,000 bids on my laptop. I did this to ask a question the Azure batches do not answer: if the same offers are aimed at one shared record, or spread across many records, how many compare-and-swap clashes appear?
+
+I did not send those 1,000 bids to Azure. At 100 bids on lot 003, `process_bid` was already failing attempts with `412` and the queue was retrying them. A message that fails five deliveries is moved to the poison queue and is not written. A thousand bids on one lot could cross that line, and some bids could be lost. The other half of the test cannot be deployed either. `receive_bid` only accepts lots `001`, `002` and `003`, while the spread case uses 20 lots. The laptop clock also stops when the in-memory function returns. It does not include Azure queue delay, so these times are not Azure times.
+
+`scripts/make_figures.py` uses the same bid rules and an in-memory compare-and-swap, up to 32 threads, seed 7, and a maximum of **80 attempts per bid**. That cap is not the deployed cap of 12. Each size was run once.
+
+![Local model: compare-and-swap clashes as the number of bids grows.](figures/contention.png)
 
 | Bids | One lot: time | One lot: clashes | One lot: abandoned | 20 lots: time | 20 lots: clashes |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -138,22 +150,14 @@ The largest experiment ran **locally, not on Azure**. `scripts/make_figures.py` 
 | 500 | 0.914 s | 511 | 0 | 0.030 s | 0 |
 | 1,000 | **15.072 s** | **8,052** | **81** | **0.127 s** | **265** |
 
-At 1,000 bids, the one-lot case had **8,052 failed compare-and-swap attempts** and **81 bids abandoned** after reaching the local retry limit. Spreading the same number of bids across 20 lots reduced clashes to **265**, with no abandoned bids. In the single-lot run, three bids were accepted, 916 were rejected as outbid, and the stored price reached the highest offer, £520.
+![Local model: time until every bid has a decision, one lot against twenty lots.](figures/latency.png)
 
-![Local experiment: processing time for one lot versus twenty lots.](figures/latency.png)
-
-The important factor was not simply the number of bids: it was **how many writers were competing for the same record**. Optimistic concurrency protected the lot state, but under heavy contention it also caused extra reads, failed writes and retries. The zero clashes at 50 and 100 bids came from individual runs; they are not evidence of a general trend.
-
-## What I learned
-
-The system exposed a trade-off I did not see from HTTP timings alone: **accepting work quickly is different from completing it quickly**. Queues let the HTTP function return without waiting, while ETags prevent conflicting lot updates. But when many bids target one file, the retries become a bottleneck.
-
-One possible improvement would be **one writer per lot**, which could reduce ETag conflicts by serialising updates to each lot. Another would be changing the retry strategy. Neither change was deployed or benchmarked, so I cannot claim a measured speed-up. Even with one writer, bids on a popular lot would still have to wait their turn.
+At 1,000 bids, one lot produced **8,052 failed compare-and-swap attempts** and **81 abandoned bids**. Twenty lots produced **265 clashes** and no abandoned bids. On the single lot, three bids were accepted, 916 were rejected as outbid, and the stored price reached the highest offer, £520. The pattern matches the Azure rush in one respect: the cost follows how many writers share a record, not only how many bids exist. The zeros at 50 and 100 bids are single runs. They are not a curve.
 
 ### Limits of this evaluation
 
 - The objects and bids are fictional; there are no accounts, payments or production auction guarantees.
-- Azure was tested with up to **100 concurrent HTTP submissions**, once per batch. The **1,000-bid** experiment was an in-memory laptop model with different retry behaviour.
+- Azure was tested with up to **100 concurrent HTTP submissions**, once per batch. The first two batches were sent while the app was idle; I did not run a separate cold-start trial. The **1,000-bid** model under Going further uses a different retry cap and does not include Azure queue time.
 - The **138.6-second** median measures two application log events for 164 matched bids, not client-to-result latency for every request.
 - The portal uses telemetry sampling. I investigated selected failures, not every error, and did not verify all 165 final result blobs.
 - The local workload results are single runs; scheduling and clash counts can vary between runs.
