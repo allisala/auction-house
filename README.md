@@ -9,6 +9,8 @@ What happens when 100 people try to bid on the same object at once? An auction h
 
 The project is a small technical prototype, not a commercial auction website. Its lots and bidders are fictional; the problem of concurrent updates is real.
 
+A clickable project demonstration is published on Figma Sites: [https://taper-vest-51396545.figma.site](https://taper-vest-51396545.figma.site). It walks through the auction, the three functions and the path a bid takes. The measurements and the deployed workflow are the ones described below.
+
 ![Three fictional auction lots: a pocket watch, a painting and a typewriter.](figures/lots.png)
 
 | Lot | Object | Starting price | Minimum increase |
@@ -152,7 +154,7 @@ After processing, `lots/003.json` had **version 161**. Seven typewriter bids wer
 
 ![Final state of the typewriter auction.](figures/azure-lot-003.png)
 
-Both queues were empty when checked and no poison queue was visible. The portal showed 164 successful `record_result` invocations and no errors in that sampled view. I then opened the blob folders. `requests/` and `results/` each contain 165 files, so every bid that `receive_bid` accepted in that workload has a result file.
+Both queues were empty when checked and no poison queue was visible. The portal showed 164 successful `record_result` invocations and no errors in that sampled view. I then opened the blob folders. At that point `requests/` and `results/` each contained 165 files. I checked five of those ids by hand. All five were present in both folders. For that sample the observed completion rate is 5 out of 5. Together with the equal counts, that is the completion evidence for the first workload. I did not open all 165 names. Later batches added more files, and those later files are not part of this 165.
 
 ![requests/ contains 165 bid files.](figures/azure-requests-count.png)
 
@@ -257,3 +259,7 @@ The source code is in [`function_app.py`](function_app.py) and [`auction.py`](au
 [4] Microsoft, [Azure Functions Python developer guide](https://learn.microsoft.com/en-us/azure/azure-functions/functions-reference-python).
 
 [5] H. T. Kung and J. T. Robinson (1981), “On optimistic methods for concurrency control,” *ACM Transactions on Database Systems*, 6(2), 213–226.
+
+## Project demonstration
+
+The clickable project demonstration is published on Figma Sites: [https://taper-vest-51396545.figma.site](https://taper-vest-51396545.figma.site).
