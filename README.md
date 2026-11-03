@@ -125,6 +125,19 @@ To look beyond HTTP responses, I matched the `Queued bid <id>` trace from `recei
 
 This was the biggest surprise of the project. The HTTP endpoint could acknowledge a burst quickly, while the same bids took much longer to reach the final recording stage. The **138.6-second median** was dominated by the typewriter rush: many queue-triggered invocations were competing to update `lots/003.json`. The interval starts at the application's queueing log, not at the client's initial request, and it is not a benchmark of an idle auction.
 
+I then repeated the measurement in separated batches, so each size could be timed on its own. Every HTTP call was accepted: 1, 5, 10, 20, 50, and 100. The log join did not return a row for 10 or for 20, and it matched 88 of the 100. The batches that did match are below.
+
+| Bids sent together | Matched in the logs | Median | 95th percentile | Slowest | Fastest |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 93.4 s | 93.4 s | 93.4 s | 93.4 s |
+| 5 | 5 | 33.2 s | 35.0 s | 35.0 s | 32.6 s |
+| 50 | 50 | 142.7 s | 142.9 s | 142.9 s | 140.8 s |
+| 100 | 88 | 137.5 s | 140.9 s | 141.5 s | 135.9 s |
+
+![Separated batches: log time from Queued bid to recorded as.](figures/azure-e2e-by-batch.png)
+
+These are not four clean measurements of an idle app. A send of 1,000 bids across the three lots had just finished its HTTP calls when the single bid went out, so that bid waited behind work that was already in the queues. That is why one bid took 93 seconds. The batches of 50 and 100 again sit near 140 seconds, the same band as the first typewriter rush. The missing rows for 10 and 20 are logs that did not join, not a claim that those bids were lost.
+
 ### 4. Why were there failed Azure invocations?
 
 Azure showed **126 successful and 106 failed `process_bid` invocations** during the busy period. I investigated the errors rather than assuming they meant 106 lost bids.
@@ -139,7 +152,11 @@ After processing, `lots/003.json` had **version 161**. Seven typewriter bids wer
 
 ![Final state of the typewriter auction.](figures/azure-lot-003.png)
 
-Both queues were empty when checked and no poison queue was visible. The portal showed 164 successful `record_result` invocations and no errors in that sampled view. These observations support the recovery story, but **I did not count and match all files in `results/`**, so I cannot confirm that every one of the 165 bids produced a final result blob.
+Both queues were empty when checked and no poison queue was visible. The portal showed 164 successful `record_result` invocations and no errors in that sampled view. I then opened the blob folders. `requests/` and `results/` each contain 165 files, so every bid that `receive_bid` accepted in that workload has a result file.
+
+![requests/ contains 165 bid files.](figures/azure-requests-count.png)
+
+![results/ contains 165 outcome files.](figures/azure-results-count.png)
 
 ## What I learned
 
@@ -169,13 +186,26 @@ I did not send those 1,000 bids to Azure. At 100 bids on lot 003, `process_bid` 
 
 At 1,000 bids, one lot produced **8,052 failed compare-and-swap attempts** and **81 abandoned bids**. Twenty lots produced **265 clashes** and no abandoned bids. On the single lot, three bids were accepted, 916 were rejected as outbid, and the stored price reached the highest offer, £520. The pattern matches the Azure rush in one respect: the cost follows how many writers share a record, not only how many bids exist. The zeros at 50 and 100 bids are single runs. They are not a curve.
 
+I then kept the number of bids fixed at 1,000 and varied the number of lots: 1, 5, 10, and 20. Each setting was run five times, with seeds 7 to 11. The bars on the graph are the lowest and highest clash counts in those five runs.
+
+![Five local runs of 1,000 bids. Clashes fall as the bids are spread across more lots.](figures/repeated_contention.png)
+
+| Lots | Median time | Time range | Median clashes | Clash range | Median abandoned |
+| ---: | ---: | --- | ---: | --- | ---: |
+| 1 | 16.75 s | 14.69–18.90 s | 9,462 | 7,563–9,737 | 87 |
+| 5 | 0.98 s | 0.84–1.05 s | 1,728 | 1,324–1,832 | 0 |
+| 10 | 0.32 s | 0.32–0.38 s | 745 | 503–850 | 0 |
+| 20 | 0.11 s | 0.08–0.14 s | 176 | 4–358 | 0 |
+
+One lot is slow in every run, and it is the only setting that abandons bids. From 5 lots upward, no run abandoned a bid. The clash count at 20 lots still jumps between runs, from 4 to 358, so I do not treat one 20-lot number as exact. The direction is stable: more lots, fewer clashes, less time. `scripts/check_invariants.py` also checks the rules on the laptop: the price does not fall, a repeated bid id is applied once, a stale version does not overwrite a newer one, a late bid is not the leader, and concurrent bids leave one leader. Five checks passed. Those checks are not a count of the Azure result files.
+
 ### Limits of this evaluation
 
 - The objects and bids are fictional; there are no accounts, payments or production auction guarantees.
 - Azure was tested with up to **100 concurrent HTTP submissions**, once per batch. The first two batches were sent while the app was idle; I did not run a separate cold-start trial. The **1,000-bid** model under Going further uses a different retry cap and does not include Azure queue time.
 - The **138.6-second** median measures two application log events for 164 matched bids, not client-to-result latency for every request.
 - The portal uses telemetry sampling. I investigated selected failures, not every error, and did not verify all 165 final result blobs.
-- The local workload results are single runs; scheduling and clash counts can vary between runs.
+- The first local graphs are single runs. The later table repeats 1,000 bids five times. Clash counts still move between runs, especially at 20 lots.
 
 ## A closer look at the bidding rules
 
